@@ -1,0 +1,1894 @@
+---
+title: "Length of Stay as Survival of Discharge"
+subtitle: "Model Training"
+author: "Paul Hooven"
+date: 8/1/2020
+#output: html_notebook
+#https://yixuan.cos.name/prettydoc/cayman.html
+output:
+  prettydoc::html_pretty:
+    #theme: hpstr
+    theme: cayman
+    #theme: tactile
+    #theme: architect
+    #theme: leonids
+    #highlight: github
+    highlight: vignette
+  rmarkdown::html_document:
+    theme: lumen
+  word_document:
+    fig_height: 4
+    fig_width: 5
+  pdf_document:
+    fig_height: 4
+    fig_width: 4.5
+  html_document:
+    fig_height: 4
+    fig_width: 4.5
+    
+---
+
+```{r aws_installs, include=FALSE, results='hide', echo=FALSE, warning=FALSE, message=FALSE, error=FALSE, eval=FALSE}
+# if you laod this on AWS from an R image, uncomment this to install necessary packages.
+install.packages(c("ranger"
+                  ,"doParallel"
+                  ,"caret"
+                  ,"e1071"
+                  ,"treemap"
+                  ,"fastDummies"
+                  ,"rpart.plot"
+                  ,"gbm"
+                  ,"forestFloor"
+                  ,"randomForestExplainer"
+                  ,"FNN"
+                  ,"randomForest"
+                  ,"glmnet"
+                  ,"anytime"
+                  ,"doMC"
+                  ,"foreach"
+                  ,"prettydoc"
+                  ,"mosaic"
+                  ,"car"
+                  ,"qqplotr"
+                  ,"tidyr"
+                  ,"ggcorrplot"
+                  ,"fields"
+                  ,"viridis"
+                  ,"ggExtra"
+                  ,"cowplot"
+                  ,"kableExtra"
+                  ,"tree"
+                  ,"fasttime"
+                  ,"psych"
+                  ,"tis"
+                  ,"DMwR"
+                  ,"ggridges"
+                ))
+install.packages(c("survival", "survminer"))
+install.packages(c("spm"))
+#install.packages("~/Downloads/ranger_0.12.1.tar.gz", repos = NULL, type = "source")
+#install.packages("~/Downloads/e1071_1.7-3.tgz", repos = NULL, type = .Platform$pkgType)
+```
+
+```{r clear_all, include=FALSE}
+# clear out variables/environment
+rm(list=ls())
+```
+
+```{r register_cores, results='hide', include=FALSE, echo=FALSE, warning=FALSE, message=FALSE, error=FALSE}
+library(foreach) 
+library(doMC)
+doMC::registerDoMC(cores = detectCores()-1)
+detectCores()
+```
+
+```{r stnd_pckgs, setup, include=FALSE, results='hide', echo=FALSE, warning=FALSE, message=FALSE}
+require(mosaic)   # Load additional packages here 
+require(car)
+require(qqplotr)
+require(tidyr)
+require(dplyr)
+library(psych) #for describe()
+require(data.table)
+require(ggplot2)
+require(ggcorrplot)
+require(fields)
+require(gridExtra)
+require(viridis)
+require(ggExtra)
+require(cowplot)
+#require(kableExtra)
+require(xtable)
+#require(textGrob)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+# Some customization.  You can alter or delete as desired (if you know what you are doing).
+#trellis.par.set(theme=theme.mosaic()) # change default color scheme for lattice
+
+# use the knitr root.dir option in the setup chunk to change the working directory for notebook chunks.
+theme_set(theme_gray())
+knitr::opts_chunk$set(
+  root.dir="~/MSDS/DS745/Networks",
+  tidy=FALSE,     # display code as typed
+  size="tiny")   # smaller font for code
+```
+
+```{r other_pckgs, results='hide', echo=FALSE, warning=FALSE, message=FALSE}
+#some packages that we don't always need...
+#require(ranger)
+#require(tree)
+#require(rpart.plot)
+#require(rpart)
+#require(gbm)
+#require(forestFloor)
+#require(randomForestExplainer)
+#require(FNN)
+#require(MASS)
+require(randomForest)
+require(glmnet)
+#require(anytime)
+#library(statnet) #networks
+#library(igraph) #networks
+#library(intergraph) #networks
+require(fasttime)
+#require(fastDummies)
+library(survival)
+library(survminer)
+```
+
+```{r}
+#forest <- rf_cv_caret$finalModel
+#save(forest, file = "PHI_data/mini.forest.rda")
+#save(interactions_frame, file = "PHI_data/mini.interactions_frame.rda")
+#save(stayday.limited, file = "PHI_data/stayday.limited.rda")
+load("PHI_data/TGH/stayday.limited2.rda")
+#ny.kaggle <- ny.kaggle.clean
+#ny.kaggle.clean <- NULL
+dim(stayday.limited)
+```
+
+----
+
+#Split data into train, validation, and test sets
+
+```{r}
+stayday.train <- stayday.limited[which(stayday.limited$ed_disposition != "AMA" 
+                                       & stayday.limited$ed_disposition != "Chart.Made.in.Error"),]
+dim(stayday.train)
+length(which(stayday.train$y.disch==TRUE))
+#stayday.train$y.days_until_disch <- NULL
+stayday.train$disch_disposition <- droplevels(stayday.train$disch_disposition)  #drop the levels for expired and LAMA
+stayday.train$means_of_arrival <- droplevels(stayday.train$means_of_arrival)
+stayday.train$admit_source <- droplevels(stayday.train$admit_source)
+stayday.train$dept_specialty <- droplevels(stayday.train$dept_specialty)
+stayday.train$revenue_location <- droplevels(stayday.train$revenue_location)
+stayday.train$patient_type_list <- droplevels(stayday.train$patient_type_list)
+stayday.train$patient_escorted_by <- droplevels(stayday.train$patient_escorted_by)
+stayday.train$ed_disposition <- droplevels(stayday.train$ed_disposition)
+
+stayday.train$max_ROM <- as.character(stayday.train$max_ROM)
+stayday.train$max_ROM[which(is.na(stayday.train$max_ROM))] <- "X"
+stayday.train$max_ROM <- as.factor(stayday.train$max_ROM)
+
+stayday.train$max_SOI <- as.character(stayday.train$max_SOI)
+stayday.train$max_SOI[which(is.na(stayday.train$max_SOI))] <- "X"
+stayday.train$max_SOI <- as.factor(stayday.train$max_SOI)
+
+stayday.train$max_acuity <- as.character(stayday.train$max_acuity)
+stayday.train$max_acuity[which(is.na(stayday.train$max_acuity))] <- "X"
+stayday.train$max_acuity <- as.factor(stayday.train$max_acuity)
+
+stayday.train$post_amlos[which(is.na(stayday.train$post_amlos))] <- median(stayday.train$post_amlos, na.rm=TRUE)
+
+stayday.train$mdc_code <- as.character(stayday.train$mdc_code)
+stayday.train$mdc_code[which(is.na(stayday.train$mdc_code))] <- "X5" #assigning to the most common category. kinda ugly
+stayday.train$mdc_code <- as.factor(stayday.train$mdc_code)
+
+names(stayday.train) <- make.names(names(stayday.train), unique = TRUE)
+
+for (i in names(stayday.train[,sapply(stayday.train, is.factor) ])) {
+  #print(i)
+  stayday.train[[i]] <- factor(stayday.train[[i]], labels = make.names(levels(stayday.train[[i]])))
+  #print(levels(stayday.train[[i]]))
+}
+```
+
+
+```{r}
+#only do these on prelim reduced dataset
+col.names <- c("admission_type", #always remove this one, its just a strict duplicate
+               "interface",
+               "revenue_location"
+               ,"cum_InpLOS"
+               #,"post_amlos"
+               ,"cum_LOS"
+               ,"cum_num_charges"
+               ,"cum_charges"
+               #the ones above should always be removed...
+               #,"dept_specialty",
+               #"ed_disposition",
+               #"DRG_chest_pain",
+               #"DRG_arrhythmia",
+               #"har_hospital_service_104.Cardiology",
+               #"har_hospital_service_166.Gynecologic.Oncology",
+               #"races_21.Cuban",
+               #"races_31.Asian.Indian.Indian.Su",
+               #"har_hospital_service_139.Ophthalmology",
+               #"infct_Parainfluenza.19.",
+               #"infct_Disseminated.Shingles.54.",
+               #"infct_Scabies.17.",
+               #"infct_Streptococcus.Group.A.11.",
+               #"infct_Enteroviral.Infection.for.Diapered.or.Incontinent.45.",
+               #"infct_Mycoplasma.12.",
+               #"infct_Head.or.Body.Lice.16.",
+               #"har_hospital_service_143.Radiation.Oncology",
+               #"har_hospital_service_123.Rehab",
+               #"har_hospital_service_165.Radiology",
+               #"har_hospital_service_153.Podiatry",
+               #"har_hospital_service_116.Newborn"
+               )
+cols <- which(colnames(stayday.train) %in% col.names)
+stayday.train <- stayday.train[,-cols]
+#stayday.mini <- stayday.train
+
+stayday.mini <- stayday.train
+```
+
+```{r}
+stayday.mini$disch_disposition <-as.character(stayday.mini$disch_disposition)
+stayday.mini[
+  which(stayday.mini$disch_disposition == "X4.Intermediate.Care.Facility"
+        | stayday.mini$disch_disposition == "X1.Home.or.Self.Care"
+        | stayday.mini$disch_disposition == "X3.Skilled.Nursing.Facility"
+        | stayday.mini$disch_disposition == "X6.Home.Health.Care.Svc"
+        | stayday.mini$disch_disposition == "X43.Federal.Hospital"                                                                    
+        | stayday.mini$disch_disposition == "X50.Hospice.Home"                                                                        
+        | stayday.mini$disch_disposition == "X51.Hospice.Medical.Facility"                                                            
+        | stayday.mini$disch_disposition == "X63.LTAC...Long.Term.Care"                                                               
+        | stayday.mini$disch_disposition == "X65.Psychiatric.Hospital"
+        | stayday.mini$disch_disposition == "X70.Another.Health.Care.Institution.Not.Defined"
+        | stayday.mini$disch_disposition == "X90.Disch.Trans.to.an.Inpt.Rehab.Facility.Unit.with.a.Planned.Readmission"
+        | stayday.mini$disch_disposition == "X81.Disch.to.Home.or.Self.Care.with.a.Planned.Readmission"                               
+        | stayday.mini$disch_disposition == "X82.Disch.Trans.to.a.Short.Term.General.Hospital.for.Inpatient.Care.Planned.Readmission" 
+        | stayday.mini$disch_disposition == "X83.Disch.Trans.to.a.SNF.with.MCARE.Certification.with.a.Planned.Readmission"            
+        | stayday.mini$disch_disposition == "X85.Disch.Trans.to.a.Designated.Cancer.Ctr.or.Children.s.Hosp.with.a.Planned.Readmission"
+        | stayday.mini$disch_disposition == "X86.Disch.Trans.to.Home.Under.Care.of.Organized.HHS.Org.with.a.Planned.Readmission"      
+        | stayday.mini$disch_disposition == "X87.Disch.Trans.to.Court.Law.Enforcement.with.a.Planned.Readmission"
+        | stayday.mini$disch_disposition == "X93.Disch.Trans.to.a.Psych.Hospital.Unit.with.a.Planned.Readmission"
+        | stayday.mini$disch_disposition == "X94.Disch.Trans.to.a.CAH.Hospital.with.a.Planned.Readmission"
+        | stayday.mini$disch_disposition == "X95.Disch.Trans.to.HC.entity.not.defined.elsewhere.in.this.list.with.a.Planned.Readmissio"
+        | stayday.mini$disch_disposition == "X205.Cancer.Center.or.Children.s.Hospital"
+        | stayday.mini$disch_disposition == "X202.Court.Law.Enforcement"
+        #above this line removed due to correlation, below removed due only to low counts in subset of data...
+        | stayday.mini$disch_disposition == "X2.Short.Term.Hospital"),]$disch_disposition <- "X"
+stayday.mini$disch_disposition <-as.factor(stayday.mini$disch_disposition)
+stayday.mini[which(stayday.mini$smoking_tobacco == "X7."
+                   #below is only due to low sample, not correlation
+                   | stayday.mini$smoking_tobacco == "X4.Quit" ),]$smoking_tobacco <- "X"
+stayday.mini[which(stayday.mini$cigarettes == "")]$cigarettes <- "false"
+stayday.mini[which(stayday.mini$drg_ROM == "X0.Refinement.not.possible"),]$drg_ROM <- "X"
+stayday.mini[which(stayday.mini$max_ROM == "X0.Refinement.not.possible"),]$max_ROM <- "X"
+stayday.mini[which(stayday.mini$max_SOI == "X0.Refinement.not.possible"),]$max_SOI <- "X"
+
+#############################
+#### below this line were removed due to low counts, not correlation...
+stayday.mini[which(stayday.mini$patient_sex == "U"),
+             ]$patient_sex <- "F"
+stayday.mini[which(stayday.mini$employment_status == "X102.Demands.of.Treatment"),
+             ]$employment_status <- "X100.Disabled"
+stayday.mini[which(stayday.mini$employment_status == "X8.Student...Part.Time"),
+             ]$employment_status <- "X7.Student...Full.Time"
+stayday.mini[which(stayday.mini$dept_specialty == "General.Surgery"),
+             ]$dept_specialty <- "Inpatient"
+stayday.mini[which(stayday.mini$admit_type == "X9.Information.Not.Available"),
+             ]$admit_type <- "X3.Elective"
+stayday.mini[which(stayday.mini$means_of_arrival == "X26.EMS.Highlands.County"
+                   | stayday.mini$means_of_arrival == "X34.EMS.Plant.City"
+                   | stayday.mini$means_of_arrival == "X36.EMS.Sarasota.County"
+                   | stayday.mini$means_of_arrival == "X29.EMS.Manatee.County"),
+             ]$means_of_arrival <- "X25.EMS.Hernando.County"
+stayday.mini[which(stayday.mini$means_of_arrival == "X1.Hospital.Transport"
+                   | stayday.mini$means_of_arrival == "X42.Sent.From.ED"),
+             ]$means_of_arrival <- "X"
+stayday.mini[which(stayday.mini$har_financial_class == "X102.Medicaid.Pending"),]$har_financial_class <- "X3.Medicaid"
+stayday.mini[which(stayday.mini$har_financial_class == "X104.HCHCP.Pending"),]$har_financial_class <- "X103.HCHCP"
+stayday.mini[which(stayday.mini$ed_disposition == "Medically.Cleared.waiting.Psych"
+                   | stayday.mini$ed_disposition == "Send.to.L.D"
+                   | stayday.mini$ed_disposition == "Discharge"
+                   | stayday.mini$ed_disposition == "Transfer.to.Another.Facility"
+                   | stayday.mini$ed_disposition == "Chart.Made.in.Error"
+                   ),]$ed_disposition <- "X"
+stayday.mini[which(stayday.mini$incident == "X01.Accident.Medical.Coverage.03.Accident.Tort.Liability"),]$incident <- "X01.Accident.Medical.Coverage"
+stayday.mini[which(stayday.mini$incident == "X03.Accident.Tort.Liability.05.Accident.No.Medical.or.Liability.Coverage"),]$incident <- "X05.Accident.No.Medical.or.Liability.Coverage"
+stayday.mini[which(stayday.mini$incident == "X11.Onset.of.Symptoms.Illness.33.First.Day.of.the.Medicare.Coordination.Period.for.ESRD.Beneficiaries.Covered.by.EGHP"
+                   | stayday.mini$incident == "X11.Onset.of.Symptoms.Illness.11.Onset.of.Symptoms.Illness"
+                   | stayday.mini$incident == "X12.Date.of.Onset.for.a.Chronically.Dependent.Individual"
+                   | stayday.mini$incident == "X44.Date.Treatment.Started.for.Occupational.Therapy"
+                   ),]$incident <- "X11.Onset.of.Symptoms.Illness"
+stayday.mini[which(stayday.mini$incident == "X22.Date.Active.Care.Ended"),]$incident <- "not_applicable"
+stayday.mini[which(stayday.mini$patient_escorted_by == "X1006.Federal.Marshall"
+                   | stayday.mini$patient_escorted_by == "X3.Tampa.police"),]$patient_escorted_by <- "X1005.Sheriffs.Office"
+stayday.mini[which(stayday.mini$admit_source == "X25.Born.inside.this.Hospital"
+                   | stayday.mini$admit_source == "X26.Born.Outside.this.Hospital"
+                   ),]$admit_source <- "X2.Physician.or.Clinic..Sent.Directly.From.Physician.Office.or.Clinic."
+stayday.mini[which(stayday.mini$lang == "oth_african"),]$lang <- "X54.Other.Other"
+stayday.mini[which(stayday.mini$marital_status == "X100.Other"),]$marital_status <- "X"
+stayday.mini[which(stayday.mini$bed_type == "X2.Incubator"
+                   | stayday.mini$bed_type == "X19.Burn.ICU"
+                   | stayday.mini$bed_type == "X" ),]$bed_type <- "X"
+stayday.mini[which(stayday.mini$room_accommodation == "X10027.ED.DEFAULT"
+                   | stayday.mini$room_accommodation == "X2.Semi.Private"),]$room_accommodation <- "X1.Private"
+stayday.mini[which(
+  stayday.mini$patient_status == "X81.Disch.to.Home.or.Self.care.w.a.Planned.Readmission"
+  ),]$patient_status <- "X01.Discharged.to.Home.or.Self.Care..Routine.Discharge."
+stayday.mini[which(
+  stayday.mini$patient_status == "X82.Disch.Trans.to.a.Short.Term.Gen.Hosp.for.Inpt.care.w.a.Planned.Readmission"
+  ),]$patient_status <- "X02.Discharged.transferred.to.a.Short.Term.General.Hospital.for.Inpatient.Care"
+stayday.mini[which(
+  stayday.mini$patient_status == "X87.Disch.Trans.to.Court.Law.Enforcement.w.a.Planned.Readmission"
+  ),]$patient_status <- "X21.Discharged.transferred.to.Court.Law.Enforcement"
+stayday.mini[which(
+  stayday.mini$patient_status == "X89.Disch.Trans.to.a.Hospital.based.Mcare.approved.swing.bed.w.a.planned.readmission"
+  | stayday.mini$disch_disposition == "X95.Disch.Trans.to.HC.entity.not.defined.elsewhere.in.this.list.with.a.Planned.Readmissio"
+  ),]$patient_status <- "X70.Disch.trans.to.Another.Type.of.Health.Care.Inst.not.Defined.Elsewhere.in.this.List"
+stayday.mini[which(
+  stayday.mini$patient_status == "X83.Disch.Trans.to.a.SNF.w.Mcare.certification.w.a.Planned.Readmission"
+  ),]$patient_status <- "X03.Discharged.transferred.to.Skilled.Nursing.Facility..SNF..with.Medicare.Certification"
+stayday.mini[which(
+  stayday.mini$patient_status == "X85.Disch.Trans.to.a.Designated.Cancer.Ctr.or.Children.s.Hosp.w.a.Planned.Readmission"
+  ),]$patient_status <- "X05.Discharged.transferred.to.a.Designated.Cancer.Center.or.Children.s.Hospital"
+stayday.mini[which(
+  stayday.mini$patient_status == "X86.Disch.Trans.to.Home.under.care.of.Organized.HHS.Org.w.a.Planned.Readmission"
+  ),]$patient_status <- "X06.Discharged.transferred.to.Home.Under.Care.of.Organized.Home.Health.Service.Org"
+stayday.mini[which(
+  stayday.mini$patient_status == "X90.Disch.Trans.to.an.Inpt.Rehab.Facility.Unit.w.a.Planned.Readmission"
+  ),]$patient_status <- "X62.Discharged.transferred.to.an.Inpatient.Rehab.Facility..IRF."
+stayday.mini[which(
+  stayday.mini$patient_status == "X94.Disch.Trans.to.a.CAH.Hospital.with.a.Planned.Readmission"
+  | stayday.mini$patient_status == "X95.Disch.Trans.to.HC.entity.not.defined.elsewhere.in.this.list.w.a.Planned.Readmission"
+  ),]$patient_status <- "X70.Disch.trans.to.Another.Type.of.Health.Care.Inst.not.Defined.Elsewhere.in.this.List"
+stayday.mini[which(
+  stayday.mini$patient_status == "X93.Disch.Trans.to.a.Psych.Hosp.Unit.w.a.Planned.Readmission"
+  ),]$patient_status <- "X65.Discharged.transferred.to.a.Psychiatric.Hospital.or.Psychiatric.Hospital.Unit"
+stayday.mini[which(stayday.mini$inp_admit_accommodation == "X10012.Observation"
+                   | stayday.mini$inp_admit_accommodation == "X10028.Outpatient.in.Bed"
+                   | stayday.mini$room_type == "X10028.Outpatient.in.Bed"
+                   | stayday.mini$room_type == "X10012.Observation"
+  ),]$inp_admit_accommodation <- "X10028.Outpatient.in.Bed"
+stayday.mini[which(
+  stayday.mini$inp_admit_accommodation == "X10014.Nursery.NICU.LV.2"
+  | stayday.mini$inp_admit_accommodation == "X10015.Neonatal.ICU.LV.3"
+  ),]$inp_admit_accommodation <- "X10020.Pedi.ICU"
+stayday.mini[which(
+  stayday.mini$inp_admit_accommodation == "X10024.Semi.Priv.Rehab"
+  | stayday.mini$inp_admit_accommodation ==  "X10021.Pediatric.Rehab"
+  | stayday.mini$inp_admit_accommodation == "X2.Semi.Private"
+  ),]$inp_admit_accommodation <- "X2.Semi.Private"
+stayday.mini[which(
+  stayday.mini$inp_admit_level_of_care == "X10.Nursery.Continuous.Care"
+  | stayday.mini$inp_admit_level_of_care == "X8.Newborn"
+  | stayday.mini$inp_admit_accommodation == "X10013.Baby.Nursery.LV.1"
+  | stayday.mini$room_accommodation == "X10013.Baby.Nursery.LV.1"
+  | stayday.mini$room_type == "X10013.Baby.Nursery.LV.1"
+  ),]$inp_admit_level_of_care <- "X9.Nursery.Special.Care"
+stayday.mini[which(
+  stayday.mini$inp_admit_accommodation == "X10013.Baby.Nursery.LV.1"),]$inp_admit_accommodation <- "X"
+stayday.mini[which(
+  stayday.mini$room_accommodation == "X10013.Baby.Nursery.LV.1"
+  | stayday.mini$room_accommodation == "X10015.Neonatal.ICU.LV.3"),]$room_accommodation <- "X"
+stayday.mini[which(
+  stayday.mini$room_type == "X10013.Baby.Nursery.LV.1"
+  | stayday.mini$room_type == "X10028.Outpatient.in.Bed"
+  | stayday.mini$room_type == "X10012.Observation"
+  ),]$room_type <- "X"
+stayday.mini[which(
+  stayday.mini$patient_type_list == "X13.Security.Watch"
+  | stayday.mini$patient_type_list == "X12.Research"
+  | stayday.mini$patient_type_list == "X1.Anonymous"
+  ),]$patient_type_list <- "X"
+stayday.mini[which(
+  stayday.mini$patient_type_list == "X3.Employee.2.CONFIDENTIAL"
+  | stayday.mini$patient_type_list == "X2.CONFIDENTIAL"
+  ),]$patient_type_list <- "X2.CONFIDENTIAL.3.Employee"
+stayday.mini[which(
+  stayday.mini$patient_type_list == "X2.CONFIDENTIAL.7.Organ.Do"
+  | stayday.mini$patient_type_list == "X7.Organ.Donor.2.CONFIDENT"
+  ),]$patient_type_list <- "X7.Organ.Donor"
+stayday.mini$infct_Enteroviral.Infection.for.Diapered.or.Incontinent.45. <- NULL
+stayday.mini$infct_Streptococcus.Group.A.11. <- NULL
+stayday.mini$infct_Pertussis.9. <- NULL
+stayday.mini$infct_Haemophilus.influenzae.13. <- NULL
+stayday.mini$infct_Meningococcemia.6. <- NULL
+stayday.mini$infct_Haemophilus.influenzae.13. <- NULL
+stayday.mini[which(stayday.mini$races_2.Black.or.Afric == 1
+                   | stayday.mini$races_2.Black.or.African.Americ == 1),]$races_2.Black.or.African.Americ <- 1
+stayday.mini$races_2.Black.or.Afric <- NULL
+stayday.mini[which(stayday.mini$races_31.Asian.Indian.Indian.Su == 1
+                   | stayday.mini$races_31.Asian.Indian == 1),]$races_31.Asian.Indian <- 1
+stayday.mini$races_31.Asian.Indian.Indian.Su <- NULL
+stayday.mini[which(stayday.mini$har_hospital_service_116.Newborn == 1),]$har_hospital_service_198.Neonatology <- 1
+stayday.mini$har_hofspital_service_116.Newborn <- NULL
+stayday.mini$har_hospital_service_[which(stayday.mini$har_hospital_service_123.Rehab == 1
+                                         | stayday.mini$har_hospital_service_122.Psychiatry ==1)] <- 1
+stayday.mini$har_hospital_service_123.Rehab <- NULL
+stayday.mini$har_hospital_service_122.Psychiatry <- NULL
+stayday.mini$har_hospital_service_118.Oncology[which(stayday.mini$har_hospital_service_143.Radiation.Oncology == 1
+                                                     | stayday.mini$har_hospital_service_166.Gynecologic.Oncology == 1)] <- 1
+stayday.mini$har_hospital_service_143.Radiation.Oncology <- NULL
+stayday.mini$har_hospital_service_166.Gynecologic.Oncology <- NULL
+stayday.mini$har_hospital_service_137.Nephrology[which(stayday.mini$har_hospital_service_189.Pediatric.Nephrology == 1)] <- 1
+stayday.mini$har_hospital_service_189.Pediatric.Nephrology <- NULL
+stayday.mini$har_hospital_service_137.Nephrology[which(stayday.mini$har_hospital_service_189.Pediatric.Nephrology == 1)] <- 1
+stayday.mini$har_hospital_service_189.Pediatric.Nephrology <- NULL
+stayday.mini$har_hospital_service_169.Ortho.Hand[which(stayday.mini$har_hospital_service_153.Podiatry == 1)] <- 1
+stayday.mini$har_hospital_service_153.Podiatry <- NULL
+
+####################
+#### TODO: make sure to remove this when i switch to admit DRGs...
+stayday.mini[which(stayday.mini$drg_qualifier == "X5.Admission.DRG"),]$drg_qualifier <- "X"
+dim(stayday.mini)
+```
+
+The technique I am using for the actual ordered factor encoding is borrowed from [here](https://www.dummies.com/programming/r/how-to-work-with-ordered-factors-in-r/).
+
+```{r ordered_factor_example, eval=FALSE, cache=FALSE, results='hide', warning=FALSE, message=FALSE}
+#First, create an ordered factor...
+
+#stayday.mini$drg_SOI, drg_ROM, max_ROM, max_SOI
+#"X"
+#"X0.Refinement.not.possible"
+#"X1.Minor"
+#"X2.Moderate"
+#"X3.Major"                  
+#"X4.Extreme"
+
+stayday.mini$max_acuity <- factor(stayday.mini$max_acuity,ordered=TRUE)
+stayday.mini$acuity_level <- factor(stayday.mini$acuity_level,ordered=TRUE)
+
+#not needed for this analysis, but if we ever include births, this might be a good idea...
+#ny.kaggle$Age.Group.disc[which(ny.kaggle$Birth.Weight == 0),] <- 0
+```
+
+```{r}
+for (i in names(stayday.mini[,sapply(stayday.mini, is.factor) ])) {
+  print(paste("--",i," -- length of levels: ",length(levels(stayday.mini[[i]]))))
+  #print(levels(stayday.mini[[i]]))
+  stayday.mini[[i]] <- droplevels(stayday.mini[[i]])
+  print(levels(stayday.mini[[i]]))
+}
+for (i in names(stayday.mini[,sapply(stayday.mini, is.factor) ])) {
+  print(paste("--",i," -- length of levels: ",length(levels(stayday.mini[[i]]))))
+  stayday.mini[[i]] <- factor(stayday.mini[[i]], labels = make.names(levels(stayday.mini[[i]])))
+  print(levels(stayday.mini[[i]]))
+}
+```
+Don't want any very large categories or any singular catgories...
+
+```{r}
+for (i in 1:dim(stayday.mini)[2]) {
+  levels.i <- length(levels(stayday.mini[,i]))
+  if ((levels.i > 32 
+      | levels.i < 2)
+      & is.factor(stayday.mini[,i])
+      ) print(paste("i: ",i, "colname: ", colnames(stayday.mini)[i], "levels: ", levels.i))
+}
+```
+
+Don't want any NAs...
+
+```{r}
+na_cols <- colSums(is.na(stayday.mini))
+colSums(is.na(stayday.mini[,which(na_cols > 0)]))
+```
+
+```{r}
+dim(stayday.mini)
+for (i in names(stayday.mini[,sapply(stayday.mini, is.numeric) ])) {
+  if (sum(stayday.mini[[i]]) == 0) {
+    print(paste("-----******* removing",i,", all zero values ******** -----"))
+    stayday.mini[[i]] <- NULL
+  }
+}
+for (i in names(stayday.mini[,sapply(stayday.mini, is.numeric) ])) {
+  if (sum(stayday.mini[[i]]) < 25 & sum(stayday.mini[[i]]) > 0 ) {
+    print(paste("-----******* found low variance:",sum(stayday.mini[[i]]),"rows with value:",i,"******** -----"))
+    #stayday.mini[[i]] <- NULL
+  }
+}
+dim(stayday.mini)
+```
+
+```{r}
+exclude_cols <- c("y.days_until_disch","y.disch.2","y.disch.3","y.disch.4","y.disch.5","visit_id")
+cols <- which(colnames(stayday.mini) %in% exclude_cols)
+lm.fit <- lm(as.numeric(y.disch) ~ ., data=stayday.mini[,-cols]);
+summary(lm.fit)
+#colnames(as.data.frame(model.matrix(lm.fit)))
+x <- model.matrix(lm.fit)[,-1]
+y <- stayday.mini$y.disch
+```
+
+
+```{r}
+dim(x)
+length(which(colSums(x) == 0))
+length(which(is.na(colSums(x))))
+colSums(x)[which(colSums(x) == 0)]
+```
+
+```{r}
+dim(x)
+for (i in names(x)) {
+  if (sum(x[[i]]) == 0) {
+    print(paste("-----******* removing",i,", all zero values ******** -----"))
+    x[[i]] <- NULL
+  }
+}
+for (i in names(x)) {
+  if (sum(x[[i]]) < 40) {
+    print(paste("-----******* low variance found",i,";",sum(x[[i]]),"unique values ******** -----"))
+    #stayday.mini[[i]] <- NULL
+  }
+}
+dim(x)
+colSums(x)[which(colSums(x) < 10 & colSums(x) > 0 )]
+
+colnames(x)[which(colSums(x) < 10 & colSums(x) > 0 )]
+```
+
+```{r adt_calc_corr, warning=FALSE,message=FALSE,error=FALSE}
+S <- cov(x)
+R <- cor(x)
+sum(diag(S))
+s.eigen <- eigen(S); s.eigen
+
+#inspect correlations for a single variable...
+#corr.data_ord[order(corr.data_ord[,"drg_ROMX4.Extreme"]),colnames(corr.data_ord) %like% "drg_ROMX4.Extreme"]
+```
+
+```{r viz_stayday_corr, fig.asp=1, fig.width=25, warning=FALSE,message=FALSE,error=FALSE }
+#library(corrplot)
+#corrplot(R)
+#library(sjPlot)
+#sjp.corr(adt_events.clean.dummies.temp[,-cols])
+
+#https://www.r-graph-gallery.com/97-correlation-ellipses.html
+library(ellipse)
+#library(viridis)
+library(RColorBrewer)
+
+## Build a Pannel of 100 colors with Rcolor Brewer
+my_colors <- brewer.pal(5, "Spectral")
+colors <- colorRampPalette(my_colors)(100*100)
+
+#colors <- c("#A50F15","#DE2D26","#FB6A4A","#FCAE91","#FEE5D9","white",
+#            "#EFF3FF","#BDD7E7","#6BAED6","#3182BD","#08519C")
+#colors <- viridis(100)
+# Order the correlation matrix
+ord <- order(R[1, ])
+corr.data_ord <- R[ord, ord]
+small.corr <- corr.data_ord[400:439,300:400]
+plotcorr(small.corr, col=colors[small.corr*(100*100/2)+(100*100/2)] 
+         #col=inferno(256)[small.corr*3+3]
+         #, diag=FALSE
+         #, type="upper"
+         , cex=.1,mar=c(1,1,1,1))
+```
+
+```{r}
+n.stayday <- dim(x)[1]
+k <- 100
+groups = c(rep(1:k,floor(n.stayday/k)),1:(n.stayday-floor(n.stayday/k)*k))  #produces list of group labels
+set.seed(100)
+cvgroups = sample(groups,n.stayday)
+
+#split stayday
+x.train <- x[which(cvgroups <= 20),]
+#x.val <- x[which(cvgroups > 10 & cvgroups <= 80 ),]
+x.test <- x[which(cvgroups > 20),]
+
+dim(x.train) #56649   437
+#dim(x.val) #
+dim(x.test) #226560    437
+```
+
+#random forest model via cross validation
+
+
+0.10536267	10	10	500
+1	2	0.09802668	20	10	500
+2	1	0.10363902	10	25	500
+2	2	0.09641911	20	25	500
+
+```{r}
+require(spm)
+library(tidyverse)
+library(lubridate)
+library(ranger)
+library(DALEX)
+library(tidymodels)
+library(rlang)
+library(doParallel)
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+#https://stackoverflow.com/questions/35154858/r-randomforest-error-when-combining-forest-produced-using-caret
+#https://stackoverflow.com/questions/23075506/how-to-improve-randomforest-performance
+#https://stats.stackexchange.com/questions/53240/practical-questions-on-tuning-random-forests
+
+ranger_day_fits <- c(1:5)
+
+starttime=proc.time()
+# run a random forest model (using ranger)
+set.seed(825)
+
+#50 is too high, 25 is too low
+
+leafsizes <- c(80)
+
+#418 is too high, 300 is too low
+#35 for daily class preds
+vars_to_sample <- c(35)
+
+splitrules <- c('variance','extratrees','maxstat')
+
+# best: 
+
+# 334, 45: .09817
+# 350, 42: .098323
+# 350, 43: .098281
+# 350, 45: .098189
+# 350, 47: .098150
+# 360, 43: .0983
+# 360, 45: .098241
+# 360, 47: .098407
+# 370, 43: .098185
+# 370, 45: .098069 <--- best
+# 370, 47: .098090
+# 375, 42: .098147
+# 380, 43: .098485
+# 380, 45: .098248
+# 380, 47: .098245
+# 390, 43: .098270
+# 390, 45: .098348
+# 390, 47: .098439
+# 390, 42: .0984
+
+#Compute weights to balance the RF
+weighted <- TRUE
+
+getweights <- function(y) {
+  fraction_0 <- length(which(y == "TRUE."))
+  fraction_1 <- length(which(y == "FALSE."))
+  # assign that value to a "weights" vector
+  weights <- numeric(length(y))
+  if (weighted == TRUE) {
+    weights[y == "FALSE."] <- fraction_0
+   weights[y == "TRUE."] <- fraction_1
+  } else {
+    weights <- rep(1, length(y))
+  }
+  return(weights)
+}
+#yremain.d <- as.numeric(stayday.mini$y.days_until_disch)
+obs_to_keep <- which(!is.na(stayday.mini$y.disch.5))
+y5 = stayday.mini$y.disch.5[obs_to_keep]
+
+#obs_to_keep <- which(!is.na(stayday.mini$y.disch.4))
+#y4 = stayday.mini$y.disch.4[obs_to_keep]
+
+
+#obs_to_keep <- which(!is.na(stayday.mini$y.disch.2))
+#y2 = stayday.mini$y.disch.2[obs_to_keep]
+
+#obs_to_keep <- which(!is.na(stayday.mini$y.disch.3))
+#y3 = stayday.mini$y.disch.3[obs_to_keep]
+
+if (is.factor(y) ) {weights <- getweights(y)}
+#Recommended to wrap the whole thing in a number of iterations...
+n <- 2 # number of iterations, 60 to 100 is recommended.
+measures <- NULL
+
+  for (j in 1:length(vars_to_sample)) {
+  for (i in 1:length(leafsizes)) {
+    
+    print(paste("trying min.node.size:",leafsizes[i],"(",i,"of",length(leafsizes),")","and mtry:",round(floor(vars_to_sample[j]),0),"(",j,"of",length(vars_to_sample),")","..."))
+    system.time(
+      ranger_d1 <-
+        ranger(#case.weights=weights,
+               x = x_keep#[obs_to_keep,],
+               ,y = y
+               ,verbose = TRUE,
+               num.trees = 1000,
+               mtry = vars_to_sample[j],
+               #seed = 1,
+               min.node.size = leafsizes[i],
+               sample.fraction = .632,
+               #importance='impurity_corrected',
+               classification=TRUE,
+               probability=TRUE,
+               splitrule="hellinger"#"extratrees"# classification: "hellinger", #"gini", #hellinger outperforms gini
+               ,respect.unordered.factors = "FALSE"
+        ))
+    
+    output <- data.frame(leaf_iter_i=i,mtry_iter_j=j)
+    output$prediction.error <- ranger_d1b$prediction.error
+    #output$predictions <- ranger_fitcv$predictions
+    #output$confusion.matrix <- ranger_fitcv$confusion.matrix
+    output$mtry <- ranger_d1b$mtry
+    output$min.node.size <- ranger_d1b$min.node.size
+    output$num.trees <- ranger_d1b$num.trees
+    measures <- rbind(measures, output)
+    print(paste("...prediction.error: ",output$prediction.error))
+    #print(paste("...confusion matrix: "),paste(paste(ranger_fitcv$confusion.matrix)))
+    
+  }
+}
+
+endtime=proc.time()
+endtime[3]-starttime[3]
+stopCluster(cl)
+```
+
+
+```{r}
+ranger_remain.d
+
+```
+
+```{r}
+remaining_LOS <- 1*(ranger_d1$predictions)
+
+stayday.mini$predicted_day1 <- remaining_LOS <- 1*(ranger_d1$predictions[,1])
+
+stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.2))] <- 
+  stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.2))] + 2*(ranger_d2b$predictions[,1])
+
+stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.3))] <- 
+  stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.3))] + 3*(ranger_d3b$predictions[,1])
+
+stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.4))] <- 
+  stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.4))] + 4*(ranger_d4b$predictions[,1])
+
+stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.5))] <- 
+  stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.5))] + 5*(ranger_d5b$predictions[,1])
+
+stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.5))] <- 
+  stayday.mini$predicted_day1[which(!is.na(stayday.mini$y.disch.5))] + (ranger_remain.d$predictions[which(!is.na(stayday.mini$y.disch.5))]-6)
+
+rmse1 <- mean((as.numeric(stayday.mini$predicted_day1 - 
+                            stayday.mini$y.days_until_disch)) * as.numeric((stayday.mini$predicted_day1 - 
+                                                                              stayday.mini$y.days_until_disch)))
+r2 <- 1 - (sum((as.numeric(stayday.mini$predicted_day1 - 
+                             stayday.mini$y.days_until_disch)) * as.numeric((stayday.mini$predicted_day1 - 
+                                                                               stayday.mini$y.days_until_disch))
+               ) / (sum((as.numeric(stayday.mini$predicted_day1 - 
+                             mean(stayday.mini$y.days_until_disch))) * as.numeric((stayday.mini$predicted_day1 - 
+                                                                               mean(stayday.mini$y.days_until_disch)))))
+               )
+```
+
+```{r}
++ 
+  2*(ranger_d2b$predictions) + 
+  3*(ranger_d3b$predictions) + 
+  4*(ranger_d4b$predictions) + 
+  5*(ranger_d5b$predictions) + 
+  (ranger_remain.d$predictions-5)
+```
+
+```{r}
+ranger_d5b
+
+```
+
+
+
+> ranger_d1$prediction.error
+[1] 0.1488017
+> 
+> ranger_d1$confusion.matrix
+NULL
+> head(ranger_d1$predictions)
+
+
+ranger_d2$prediction.error
+head(ranger_d2$predictions)
+[1] 0.1644914
+        FALSE.     TRUE.
+[1,] 0.7739176 0.2260824
+[2,] 0.7505624 0.2494376
+[3,] 0.7385313 0.2614687
+[4,] 0.8162076 0.1837924
+[5,] 0.8282407 0.1717593
+[6,] 0.8462352 0.1537648
+
+ranger_d3$prediction.error
+head(ranger_d3$predictions)
+[1] 0.172572
+        FALSE.     TRUE.
+[1,] 0.7210856 0.2789144
+[2,] 0.7297218 0.2702782
+[3,] 0.8385513 0.1614487
+[4,] 0.8499272 0.1500728
+[5,] 0.8641193 0.1358807
+[6,] 0.8728999 0.1271001
+
+ranger_d4$prediction.error
+head(ranger_d4$predictions)
+[1] 0.1758284
+        FALSE.     TRUE.
+[1,] 0.7510352 0.2489648
+[2,] 0.8161142 0.1838858
+[3,] 0.8549291 0.1450709
+[4,] 0.8546037 0.1453963
+[5,] 0.8804029 0.1195971
+[6,] 0.8851884 0.1148116
+
+ranger_d5$prediction.error
+head(ranger_d5$predictions)
+[1] 0.179042
+        FALSE.     TRUE.
+[1,] 0.7763238 0.2236762
+[2,] 0.7104679 0.2895321
+[3,] 0.8176711 0.1823289
+[4,] 0.8319528 0.1680472
+[5,] 0.8502003 0.1497997
+[6,] 0.8618155 0.1381845
+
+```{r}
+ranger_remain.d$prediction.error
+mean(ranger_remain.d$predictions)
+mean(log(ranger_remain.d$predictions))
+ranger_remain.d$r.squared
+```
+
+```{r}
+ranger_d2
+```
+
+
+```{r}
+explainer_rf_d1_c  <- explain(ranger_d1_imp,
+                              data = x,
+                              y = y)
+```
+
+```{r eval=FALSE}
+save(explainer_rf_d1, file = "PHI_data/explainer_rf_d1.rda")
+#load("PHI_data/balanced.tosave.rda")
+```
+
+```{r warning=FALSE}
+#http://ema.drwhy.ai/featureImportance.html
+varImp_rf_d1_c <- variable_importance(explainer_rf_d1_c, B=10, type="raw")
+```
+
+```{r fig.width=15, fig.asp=.4}
+summarize_vi <- varImp_rf_d1_c %>%
+  group_by(variable) %>% 
+  summarize(mean_dropout_loss = mean(dropout_loss), .groups = "drop") %>%
+  arrange(-mean_dropout_loss) %>%
+  mutate(variable = factor(variable, levels = variable))  
+
+ggplot(data = summarize_vi[c(2:17,20:32),],
+       aes(y = mean_dropout_loss, x = variable, group = 1)) +
+  geom_line() +
+  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+```{r fig.asp=2,fig.width=20}
+varImp_rf_d1_c <- data.table(varImp_rf_d1_c)
+varImp_dalex_groupby <- varImp_rf_d1_c %>% group_by(variable) %>%
+  summarize(mean_drop_loss = mean(dropout_loss)) %>% arrange(., -mean_drop_loss)
+
+varImp_dalex_groupby <- varImp_dalex_groupby[2:50,]
+
+varImp_rf_d1_c <- varImp_rf_d1_c[which(varImp_rf_d1_c$variable %in% varImp_dalex_groupby$variable),]
+
+```
+
+```{r}
+varImp_dalex_groupby[1:32,]
+
+```
+
+
+```{r fig.asp=2,fig.width=20}
+plot(varImp_rf_d1_c)
+```
+
+```{r}
+var_to_keep <-  summarize_vi %>%
+  filter(mean_dropout_loss > 0.43539 & variable != "_baseline_") %>% 
+  select(variable)
+
+cols <- which(colnames(x) %in% data.frame(var_to_keep)$variabl)
+x_keep <- x[,cols]
+```
+
+
+```{r}
+ranger_predictions_after_vi <- predict(ranger_model_after_vi,
+                                       x_valid %>% select(var_to_keep$variable))
+
+eval_model(
+  ranger_model_after_vi, y_train, y_valid, ranger_predictions_after_vi$predictions)
+```
+
+```{r}
+install.packages("devtools")
+library(devtools) 
+install_github("swager/randomForestCI")
+library(randomForestCI)
+library(dplyr) # For data manipulation
+library(randomForest) # For random forest ensemble models
+library(ggplot2)
+
+```
+
+
+
+```{r}
+measures
+```
+
+
+```{r}
+
+plot(measures ~ c(1:n), xlab = "Iteration for RF", ylab = "Correct
+classification rate  (%)")
+points(cumsum(measures) / c(1:n) ~ c(1:n), col = 2)
+abline(h = mean(measures), col = 'blue', lwd = 2)
+
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ranger)
+library(DALEX)
+library(tidymodels)
+library(rlang)
+library(doParallel)
+cl <- makePSOCKcluster(detectCores())
+registerDoParallel(cl)
+
+#https://stackoverflow.com/questions/35154858/r-randomforest-error-when-combining-forest-produced-using-caret
+#https://stackoverflow.com/questions/23075506/how-to-improve-randomforest-performance
+#https://stats.stackexchange.com/questions/53240/practical-questions-on-tuning-random-forests
+
+starttime=proc.time()
+# run a random forest model (using ranger)
+set.seed(825)
+
+exclude_cols <- c("y.days_until_disch","y.disch.2","y.disch.3","y.disch.4","y.disch.5")
+cols <- which(colnames(stayday.mini) %in% exclude_cols)
+
+#https://olgamie.github.io/2020/09/30/building-first-baseline-with-random-forest-using-ranger-and-dalex/
+
+x2 <- x[which(!is.na(stayday.mini$y.disch.2)),]
+y2 = stayday.mini$y.disch.2[which(!is.na(stayday.mini$y.disch.2))]
+
+system.time(
+  ranger_fit_d2 <- 
+     ranger(x = x,
+     y = y,
+     num.trees = 1000,
+     mtry = sqrt(ncol(x))+5, 
+     seed = 1,
+     min.node.size = 10,
+     sample.fraction = 1,
+     importance='impurity',
+     classification=TRUE,
+     probability=TRUE,
+     splitrule="hellinger",
+     respect.unordered.factors = "FALSE"
+  ))
+
+endtime=proc.time()
+endtime[3]-starttime[3]
+stopCluster(cl)
+```
+
+
+```{r eval=FALSE}
+#https://stackoverflow.com/questions/54322698/train-random-forest-with-caret-using-parallel
+#http://rstudio-pubs-static.s3.amazonaws.com/396053_d752439324a14f7e98224a144d9be01c.html#:~:text=randomForest%2C%20the%20rule%20of%20thumb,predictor%20variables%20(rounded%20down).
+require(caret)
+require(ggplot2)
+#require(ranger)
+require(dplyr)
+require(e1071)
+require(foreach)
+require(import)
+require(randomForest)
+
+myControl.ROC <- trainControl(method ="cv",  #repeatedcv
+                          number = 5,
+                          #repeats = 3,
+                          allowParallel=TRUE,
+                          savePredictions = "final",
+                          summaryFunction = twoClassSummary,
+                          classProbs = TRUE,
+                          verboseIter = FALSE)
+
+min_leaf_size <- length(stayday.mini[,1]) * .001 #(recommendation is .001)
+
+# define a grid of parameter options to try
+rf_grid <- expand.grid(#splitrule = "variance",
+                      #mtry=c(7,11,15,25),
+                      mtry=c(15,30,100) #sqrt(predictors) = 22.6
+                      , min.node.size = c(10,30,50)
+                      , splitrule="hellinger" #"gini","extratrees"
+                      #,num.threads=3, #number of CPU cores available
+                      #seed=825,
+                      #write.forest = FALSE
+                      #min.node.size = 10
+                      #nodesize=min_leaf_size
+                  )
+
+#fit_rf<-randomForest(y.disch~.-y.days_until_disch,
+#        data=stayday.train,
+#        importance=TRUE,
+#        proximity=TRUE,
+#        na.action=na.roughfix)
+  
+# set.seed(3001)
+# myGrid <- expand.grid(.mtry = c(7:11))
+# 
+# Model.mice.ROC <- train(Survived ~., data = titanic.train[,-1],
+#                 method = "rf",
+#                 trControl = myControl.ROC,
+#                 metric = "ROC",
+#                 tuneGrid = myGrid
+#                 )
+# Model.mice.ROC
+
+```
+
+```{r eval=FALSE}
+library(doParallel)
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+#https://stackoverflow.com/questions/35154858/r-randomforest-error-when-combining-forest-produced-using-caret
+#https://stackoverflow.com/questions/23075506/how-to-improve-randomforest-performance
+#https://stats.stackexchange.com/questions/53240/practical-questions-on-tuning-random-forests
+
+require(caret)
+
+starttime=proc.time()
+# run a random forest model (using ranger)
+set.seed(825)
+
+exclude_cols <- c("y.days_until_disch","y.disch.2","y.disch.3","y.disch.4","y.disch.5","visit_id")
+cols <- which(colnames(stayday.mini) %in% exclude_cols)
+
+system.time(rf_cv_caret <- train(x=x,
+                     y=y, 
+                     #data = stayday.mini[,-cols],
+                     method = "ranger",
+                     num.trees = 1000,
+                     trControl = myControl.ROC,
+                     # provide a grid of parameters
+                     tuneGrid = rf_grid,
+                     sample.fraction = 1,
+                     importance='impurity',
+                     classification=TRUE,
+                     probability=TRUE,
+                     respect.unordered.factors = "FALSE",
+                     metric="ROC",
+                     num.threads = 7
+                     ))
+endtime=proc.time()
+endtime[3]-starttime[3]
+
+## When you are done:
+stopCluster(cl)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ranger)
+library(DALEX)
+library(tidymodels)
+library(rlang)
+library(doParallel)
+cl <- makePSOCKcluster(detectCores()-1)
+registerDoParallel(cl)
+
+#https://stackoverflow.com/questions/35154858/r-randomforest-error-when-combining-forest-produced-using-caret
+#https://stackoverflow.com/questions/23075506/how-to-improve-randomforest-performance
+#https://stats.stackexchange.com/questions/53240/practical-questions-on-tuning-random-forests
+
+starttime=proc.time()
+# run a random forest model (using ranger)
+set.seed(825)
+
+exclude_cols <- c("y.days_until_disch","y.disch.2","y.disch.3","y.disch.4","y.disch.5")
+cols <- which(colnames(stayday.mini) %in% exclude_cols)
+
+#min_leaf_size <- length(stayday.mini[,1]) * .001 #(recommendation is .001)
+
+#https://olgamie.github.io/2020/09/30/building-first-baseline-with-random-forest-using-ranger-and-dalex/
+
+x2 <- x[which(!is.na(stayday.mini$y.disch.2)),]
+y2 = stayday.mini$y.disch.2[which(!is.na(stayday.mini$y.disch.2))]
+
+system.time(
+  ranger_fit_d2 <- 
+     ranger(x = x,
+     y = y,
+     num.trees = 1000,
+     mtry = sqrt(ncol(x))+5, 
+     seed = 1,
+     min.node.size = 10,
+     sample.fraction = 1,
+     importance='impurity',
+     classification=TRUE,
+     probability=TRUE,
+     splitrule="hellinger",
+     respect.unordered.factors = "FALSE"
+  ))
+
+endtime=proc.time()
+endtime[3]-starttime[3]
+
+#fit_rf<-randomForest(y.days_until_disch~.,
+#        data=store_train,
+#        importance=TRUE,
+#        prOximity=TRUE,
+#        na.action=na.roughfix)
+
+## When you are done:
+stopCluster(cl)
+```
+```{r}
+sort(-ranger_fit$variable.importance)
+```
+
+```{r}
+sort(-ranger_fit_d2$variable.importance)
+```
+
+
+```{r}
+ranger_d1$prediction.error
+
+ranger_d1$confusion.matrix
+head(ranger_d1$predictions)
+# [1] 0.1209294
+#         predicted
+# true     FALSE.  TRUE.
+#   FALSE. 164178   2481
+#   TRUE.   21148   7588
+
+# [1] 0.09721601
+# NULL
+#         FALSE.      TRUE.
+# [1,] 0.9502128 0.04978722
+# [2,] 0.8970641 0.10293585
+# [3,] 0.8972218 0.10277824
+# [4,] 0.9660529 0.03394715
+# [5,] 0.9757325 0.02426752
+# [6,] 0.9821643 0.01783566
+
+###### d2:
+# [1] 0.1122929
+# NULL
+#         FALSE.      TRUE.
+# [1,] 0.8827003 0.11729969
+# [2,] 0.9515572 0.04844275
+# [3,] 0.9807136 0.01928635
+# [4,] 0.9758200 0.02417997
+# [5,] 0.9767832 0.02321684
+# [6,] 0.9790633 0.02093672
+
+# [1] 0.09663594
+# NULL
+#         FALSE.       TRUE.
+# [1,] 0.9916633 0.008336706
+# [2,] 0.9107498 0.089250226
+# [3,] 0.9980841 0.001915895
+# [4,] 0.9753001 0.024699923
+# [5,] 0.9928636 0.007136426
+# [6,] 0.9927359 0.007264149
+```
+
+```{r}
+ranger_predictions <- predict(ranger_fit, x)
+
+rmse <- function(preds, y){
+  sqrt(mean((preds - y)**2))
+}
+eval_model <- function(model, y, y_valid, model_predictions) {
+  c(model$r.squared,
+      rmse(model$predictions, y),
+      rmse(model_predictions, y_valid)
+  )
+}
+```
+
+```{r eval=FALSE}
+library(doParallel)
+#registerDoParallel(detectCores()-1)
+
+library(doParallel)
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+
+exclude_cols <- c("y.days_until_disch","y.disch.2","y.disch.3","y.disch.4","y.disch.5","visit_id")
+cols <- which(colnames(stayday.mini) %in% exclude_cols)
+
+rf_cv_caret <- train(#x=x,
+                     #y=y,
+                     y.disch ~ .,
+                     data = stayday.mini[,-cols],
+                     method = "rf",
+                     trControl = myControl.ROC,
+                     # provide a grid of parameters
+                     tuneGrid = rf_grid,
+                     importance=T, #not sure if this is still used?
+                     nodesize=min_leaf_size,
+                     #localImp = T,
+                     proximity=T, #not sure if this is still used?
+                     #na.action=na.roughfix,
+                     metric = "ROC"
+                     )
+
+starttime=proc.time()
+# run a random forest model (using ranger)
+set.seed(825)
+rf_ranger_caret <- train(log.ccr ~ ., 
+                data = df.train,
+                method = "ranger",
+                trControl = fit_control,
+                # provide a grid of parameters
+                tuneGrid = rf_grid)
+endtime=proc.time()
+endtime[3]-starttime[3]
+```
+
+```{r}
+## Clean Model to Save Memory
+
+## http://stats.stackexchange.com/questions/102667/reduce-random-forest-model-memory-size
+stripRF <- function(cm) {
+  cm$finalModel$predicted <- NULL 
+  cm$finalModel$oob.times <- NULL 
+  cm$finalModel$y <- NULL
+  cm$finalModel$votes <- NULL
+  cm$control$indexOut <- NULL
+  cm$control$index    <- NULL
+  cm$trainingData <- NULL
+
+  attr(cm$terms,".Environment") <- c()
+  attr(cm$formula,".Environment") <- c()
+
+  cm
+}
+```
+
+http://www.rebeccabarter.com/blog/2020-03-25_machine_learning/
+
+http://www.rebeccabarter.com/blog/2017-11-17-caret_tutorial/
+The following code performs 10-fold cross-validation while respecting the groups in the abalone data. That is, each group of abalone must always appear in the same group together.
+
+# perform grouped K means
+group_folds <- groupKFold(abalone_grouped$group, k = 10)
+group_folds
+
+#blog post that goes through whole process of cleaning and fitting
+https://m-clark.github.io/introduction-to-machine-learning/opening-the-black-box.html#feature-selection-the-data-partition
+
+#balancing classes
+
+```{r}
+# https://www.rdocumentation.org/packages/DMwR/versions/0.4.1/topics/SMOTE
+# oversample minority class and undersample majority class with DMwR::SMOTE()
+## now using SMOTE to create a more "balanced problem"
+require(DMwR)
+set.seed(100)
+
+balanced.raw <- DMwR::SMOTE(y.disch~.-y.days_until_disch, data=stayday.train,
+                  k=5, #number of nearest neighbors to use when generating synthetic minority class examples
+                  perc.over = 300, # 4x minority class (add 300%)
+                  perc.under = 134) # 134% of the number of cases added to the minority class will be selected from the majority class
+table(balanced.raw$y.disch)
+
+#TGH:  FALSE   TRUE 
+#     176309 175432
+
+#300,134
+#    0     1 
+#45538 45312 
+
+#300,100
+# 0     1 
+#33984 45312
+
+#300,80 =  
+#0     1 
+#27187 45312
+```
+
+#penalized regression model via cross validation
+
+[This post](https://stats.stackexchange.com/questions/357407/glmnet-weights-and-imbalanced-data) provided a reference for the weighting logic used below.
+
+```{r stayday_glmnet_fit, warning=FALSE,message=FALSE,error=FALSE}
+weighted <- TRUE
+fraction_0 <- length(which(y == TRUE))
+fraction_1 <- length(which(y == FALSE))
+# assign that value to a "weights" vector
+weights <- numeric(length(y))
+if (weighted == TRUE) {
+  weights[y == FALSE] <- fraction_0
+  weights[y == TRUE] <- fraction_1
+} else {
+  weights <- rep(1, length(y))
+}
+require(glmnet)
+
+#alphalist = c(0, .2, .5, .80, .99, 1)
+# https://stackoverflow.com/questions/21698435/executing-glmnet-in-parallel-in-r
+# https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html
+
+#registerDoMC(cores=4)
+doMC::registerDoMC(cores = detectCores()-1)
+detectCores()
+#cvfit.auc = cv.glmnet(x, y, family = "binomial", parallel = TRUE, alpha=.9, type.measure = "auc") #, type.measure = "class" (misclassification error) or "deviance" or "mae??? uses mean absolute error.
+cvfit.auc.alpha.99 = cv.glmnet(x, y, family = "binomial", weights=weights, parallel = TRUE, alpha=.99, type.measure = "auc") #, type.measure = "class" (misclassification error) or "deviance" or "mae??? uses mean 
+```
+
+```{r adt_glmnet_coef, warning=FALSE,message=FALSE,error=FALSE}
+coef(cvfit.auc.alpha.99, s="lambda.min")
+```
+
+
+
+
+```{r}
+balanced <- balanced.raw
+balanced$y.days_until_disch <- NULL
+balanced$disch_disposition <- droplevels(balanced$disch_disposition)  #drop the levels for expired and LAMA
+```
+
+balanced dataset will have `r dim(balanced)[1]` rows and `r dim(balanced)[2]` columns.
+
+save data checkpoint...
+
+```{r eval=FALSE}
+#balanced.tosave <- balanced
+#save(balanced.tosave, file = "PHI_data/balanced.tosave.rda")
+load("PHI_data/balanced.tosave.rda")
+balanced <- balanced.tosave
+balanced.tosave <- NULL
+```
+
+```{r}
+for (i in names(balanced[,sapply(balanced, is.factor) ])) {
+  print(i)
+  balanced[[i]] <- factor(balanced[[i]], labels = make.names(levels(balanced[[i]])))
+  print(levels(balanced[[i]]))
+}
+```
+
+```{r}
+#https://www.rdocumentation.org/packages/stats/versions/3.6.2/topics/lm
+#just using this to get matrix, output as numeric isn't what we want
+lm.fit <- lm(as.numeric(y.disch) ~ ., data = balanced);
+```
+
+```{r}
+summary(lm.fit)
+```
+
+```{r}
+colnames(as.data.frame(model.matrix(lm.fit.full)))
+```
+
+
+[Useful post](#https://stackoverflow.com/questions/21698435/executing-glmnet-in-parallel-in-r) on parallel processing with glmnet...
+
+```{r}
+require(glmnet)
+
+#MM <- model.matrix(ff,dat)
+#MM <- MM[match(rownames(dat),rownames(MM)),]
+#MM[,"b"] <- dat$b
+#rownames(MM) <- rownames(dat)
+
+#s.numeric(y.disch)~.
+
+#balanced[which(balanced$means_of_arrival == "42^Sent From ED"),]
+
+#ff <- formula(lm.fit.full)
+
+#MM <- model.matrix(ff,balanced)
+#MM <- MM[match(rownames(balanced),rownames(MM)),]
+#rownames(MM) <- rownames(balanced)
+
+#x <- model.matrix(lm.fit., data=balanced.new, 
+#             contrasts.arg = lapply(balanced[,sapply(balanced, is.factor) ], contrasts, contrasts=FALSE), na.action = "na.pass")[,-1]
+
+#x <- model.matrix.lm(as.numeric(y.disch)~., data=balanced, na.action = "na.pass")
+#x <- x[,-1]
+#x <- model.matrix(lm.fit)[,-1]
+#y <- balanced$y.disch
+
+# https://stackoverflow.com/questions/21698435/executing-glmnet-in-parallel-in-r
+# https://web.stanford.edu/~hastie/glmnet/glmnet_alpha.html
+
+#registerDoMC(cores=4)
+doMC::registerDoMC(cores = detectCores()-1)
+detectCores()
+#cvfit.auc = cv.glmnet(x, y, family = "binomial", parallel = TRUE, alpha=.9, type.measure = "auc") #, type.measure = "class" (misclassification error) or "deviance" or "mae??? uses mean absolute error.
+cvfit.auc.aplha.99 = cv.glmnet(x, y, family = "binomial", parallel = TRUE, alpha=.99, type.measure = "auc") #, type.measure = "class" (misclassification error) or "deviance" or "mae??? uses mean 
+#11:53 AM start
+#1:29 PM start
+```
+
+```{r eval=FALSE}
+cvfit.auc.aplha.99.tosave <- cvfit.auc.aplha.99
+save(cvfit.auc.aplha.99.tosave, file = "PHI_data/cvfit.auc.aplha.99.tosave.rda")
+#load("PHI_data/balanced.tosave.rda")
+#balanced <- balanced.tosave
+#balanced.tosave <- NULL
+```
+
+```{r}
+summary(cvfit.auc.aplha.99)
+plot(cvfit.auc.aplha.99)
+cvfit.auc.aplha.99$lambda.min
+cvfit.auc.aplha.99$lambda.1se
+
+#cvfit.auc: 0.0001142894
+#cvfit.auc: 0.0008849014
+
+#cvfit.auc.aplha.9: 0.000167871
+#cvfit.auc.aplha.9: 0.0008958769
+```
+
+
+```{r}
+require(caret)
+names(balanced.new) <- make.names(names(balanced.new), unique = TRUE)
+myFolds <- createFolds(y, k = 5)
+
+#Create trainControl object: myControl
+myControl <- trainControl(
+ summaryFunction = twoClassSummary,
+ classProbs = TRUE, # IMPORTANT!
+ verboseIter = TRUE,
+ savePredictions = TRUE,
+ index = myFolds
+)
+
+model_glmnet <- train(y.disch ~ ., data = balanced.new,
+  metric = "ROC",
+  method = "glmnet",
+  trControl = myControl,
+  na.action = na.pass
+)
+
+#Fitting alpha = 1, lambda = 0.000324 on full training set
+```
+
+```{r}
+predictions.cvfit.auc.aplha.99.response <- predict(cvfit.auc.aplha.99, newx=x, type="response") #"link", "response", "coefficients", "nonzero""
+```
+
+```{r}
+plot(model_glmnet)
+model_glmnet$lambda.min
+model_glmnet$lambda.1se
+```
+
+```{r}
+coef(cvfit.auc.aplha.99, s = "lambda.min")
+```
+
+```{r}
+coef(cvfit, s = "lambda.min")
+```
+
+```{r}
+initial.ENET.remove <- names(coef(model_glmnet$finalMode, s = 0.000324)[which(coef(model_glmnet$finalModel, s =0.000324) == 0),1])
+length(which(coef(model_glmnet$finalModel, s=0.000324) == 0))
+initial.ENET.remove
+```
+
+```{r}
+initial.ENET.remove.auc <- names(coef(cvfit.auc.aplha.99, s = "lambda.min")[which(coef(cvfit.auc.aplha.99, s = "lambda.min") == 0),1])
+length(which(coef(cvfit.auc.aplha.99, s = "lambda.min") == 0))
+initial.ENET.remove.auc
+```
+
+```{r}
+initial.ENET.remove.cvfit.auc.aplha.9 <- names(coef(cvfit.auc.aplha.9, s = "lambda.min")[which(coef(cvfit.auc.aplha.9, s = "lambda.min") == 0),1])
+length(which(coef(cvfit.auc.aplha.9, s = "lambda.min") == 0))
+initial.ENET.remove.cvfit.auc.aplha.9
+```
+
+
+
+```{r}
+initial.ENET.remove <- names(coef(cvfit, s = "lambda.min")[which(coef(cvfit, s = "lambda.min") == 0),1])
+length(which(coef(cvfit, s = "lambda.min") == 0))
+initial.ENET.remove
+```
+
+```{r}
+ENET.predictions.cvfit.auc.aplha.99 <- predict(cvfit.auc.aplha.99, newx = x,  s = "lambda.min", type = "class")
+paste("predictions == TRUE:", length(which(ENET.predictions.cvfit.auc.aplha.99 == "TRUE.")))
+length(which(y == "TRUE."))
+mean(ENET.predictions.cvfit.auc.aplha.99[1])
+summary(y)
+table(y,ENET.predictions.cvfit.auc.aplha.99)
+#y        FALSE.  TRUE.
+#  FALSE. 150327  25982
+#  TRUE.   31292 144140
+```
+
+```{r}
+ENET.predictions.auc <- as.logical(predict(cvfit.auc, newx = x,  s = "lambda.min", type = "class"))
+paste("predictions == TRUE:", length(which(ENET.predictions.auc == TRUE)))
+length(which(y == TRUE))
+mean(ENET.predictions.auc[1])
+summary(y)
+table(y,ENET.predictions.auc)
+```
+
+```{r}
+#lambda for most regularized model, such that error is within one standard error of minimum
+ENET.predictions.1se <- as.logical(predict(cvfit, newx = x,  s = "lambda.1se", type = "class"))
+paste("predictions == TRUE:", length(which(ENET.predictions.1se == TRUE)))
+length(which(y == TRUE))
+mean(ENET.predictions.1se[1])
+summary(y)
+table(y,ENET.predictions.1se)
+```
+
+```{r}
+#lambda giving minimum error
+ENET.predictions <- as.logical(predict(cvfit, newx = x,  s = "lambda.min", type = "class"))
+paste("predictions == TRUE:", length(which(ENET.predictions == TRUE)))
+length(which(y == TRUE))
+mean(ENET.predictions[1])
+summary(y)
+table(y,ENET.predictions)
+#        ENET.predictions
+# y        FALSE   TRUE
+#   FALSE 150386  25923
+#   TRUE   31222 144210
+```
+
+```{r}
+ENET.predictions.caret <- predict(model_glmnet, newx = x, s=0.000324, type = "raw")
+```
+```{r}
+paste("predictions == TRUE.:", length(which(ENET.predictions.caret == "TRUE.")))
+length(which(y == TRUE))
+mean(ENET.predictions.caret[1])
+summary(y)
+table(y,ENET.predictions.caret)
+```
+
+
+```{r}
+ENET.predictions.caret.prob <- predict(model_glmnet, newx = x, s=0.000324, type = "prob")
+#      FALSE.       TRUE.
+# 1 0.8877152 0.112284778
+# 2 0.8173468 0.182653171
+# 3 0.6715990 0.328401048
+# 4 0.9820617 0.017938306
+# 5 0.9969991 0.003000914
+# 6 0.7042756 0.295724383
+```
+
+```{r}
+library(glmnet)
+# https://statisticaloddsandends.wordpress.com/2020/03/28/a-deep-dive-into-glmnet-predict-glmnet/
+# https://cran.r-project.org/web/packages/glmnet/vignettes/glmnetFamily.pdf
+# Refit elastic NET (alpha between 0 and 1)
+x <- model.matrix(lm.fit.full)[,-1]
+y <- stayday.train$y.disch
+ENET.fit = glmnet(x, y, alpha = .5, family = "binomial") # allowing to select its own lambdas for now
+coef(ENET.fit)
+ENET.pred <- predict(ENET.fit, newx=x)
+#plot(1:571, ENET.pred) ???
+
+initial.ENET.remove <- names(coef(ENET.fit, s=best.lambda.in[a.best])[which(coef(ENET.fit, s=best.lambda.in[a.best]) == 0),1])
+length(which(coef(ENET.fit, s=best.lambda.in[a.best]) == 0))
+
+```
+
+```{r}
+#TODO: need to determine how to find error in prediction list for each given lambda. just picking one for now...
+
+#coef(ENET.fit)
+ENET.fit$lambda[40]
+coef(ENET.fit, s=ENET.fit$lambda[40])
+#initial.ENET.remove <- names(coef(ENET.fit, s=best.lambda.in[a.best])[which(coef(ENET.fit, s=best.lambda.in[a.best]) == 0),1])
+#length(which(coef(ENET.fit, s=best.lambda.in[a.best]) == 0))
+
+plot(ENET.fit, xvar = "dev", label = TRUE)
+
+```
+###Remove variables with coefficients within one standard error of zero...
+
+Get p-values/error estimates for ENET coefficients (to possibly reduce their number...)
+
+Using [parallel bootstrapping via boot](https://stackoverflow.com/questions/31351526/use-parallel-option-of-boot-function-in-r) package. 
+
+https://cran.r-project.org/web/packages/bcaboot/vignettes/bcaboot.html
+
+```{r}
+library(glmnet)
+glmnet_boot <- function(B, X, y, glmnet_model, var = "resp") {
+    lambda <- cvfit.auc.aplha.99$lambda.min
+    theta <- as.matrix(coef(cvfit.auc.aplha.99, s = lambda))
+    pi_hat <- predict(cvfit.auc.aplha.99, newx = X, s = "lambda.min", type = "response")
+    n <- length(pi_hat)
+    y_star <- sapply(seq_len(B), function(i) ifelse(runif(n) <= pi_hat, 1, 0))
+    beta_star <- apply(y_star, 2,
+                       function(y) {
+                           as.matrix(coef(glmnet::glmnet(x = X, y = y, lambda = lambda, family = "binomial")))
+                       })
+
+    rownames(beta_star) <- rownames(theta)
+    list(theta = theta[var, ],
+         theta_star = beta_star[var, ],
+         suff_stat = t(y_star) %*% X)
+}
+```
+
+```{r}
+glmnet_boot_out <- glmnet_boot(B = 10, x, y, cvfit.auc.aplha.99)
+glmnet_bca <- bcapar(t0 = glmnet_boot_out$theta,
+                     tt = glmnet_boot_out$theta_star,
+                     bb = glmnet_boot_out$suff_stat)
+```
+
+
+```{r}
+library(glmnet)
+x <- model.matrix(lm.fit)[,-1]
+y <- balanced$y.disch
+
+if (exists('cvfit.auc.aplha.9') && is.data.frame(get('cvfit.auc.aplha.9'))) {
+} else {
+  cvfit.auc.aplha.9 <- data.frame(lamda.min=0.000167871)
+}
+
+#library(doParallel)
+#library(doMC)
+#registerDoMC()
+
+#library(doParallel)
+#registerDoParallel(detectCores()-1)
+
+library(foreach) 
+library(doMC)
+doMC::registerDoMC(cores = detectCores()-1)
+detectCores()
+
+library(boot)
+
+starttime=proc.time()
+# glmnet - elastic net with bootstrapping
+
+#bestlambdaENET = best.lambda.in[a.best]
+#bestalphaENET <- alphalist[a.best]
+beta.fn.ENET = function(inputdata,index) {
+  yboot = inputdata[index,1]
+  xboot = inputdata[index,-1]
+  ENETfitboot = glmnet(xboot, 
+                       yboot, 
+                       alpha=.9, 
+                       lambda=cvfit.auc.aplha.9$lamda.min
+                       #,parallel=TRUE
+                       )
+  return(coef(ENETfitboot,s=cvfit.auc.aplha.9$lamda.min)[,1])
+}
+set.seed(100)
+ENETbootoutput = boot(cbind(y,x), 
+                      beta.fn.ENET,
+                      R=1000,
+                      parallel="multicore",
+                      ncpus=detectCores()-1
+                      )
+endtime=proc.time()
+endtime[3]-starttime[3]
+```
+
+```{r eval=FALSE}
+ENET.cv.resid <- ENET.pred.test - ny.test$log.ccr
+ENET.cv.MSE <- mean(ENET.cv.resid^2); rf.cv.MSE
+```
+
+```{r eval=FALSE}
+plot(ny.test$log.ccr,ENET.cv.resid, xlab="Response", ylab="Residual",main="Random Forest CCR Residuals vs Fitted")
+```
+
+```{r eval=FALSE}
+#print(ENETbootoutput)
+#t - A matrix with sum(R) rows each of which is a bootstrap replicate of the result of calling statistic.
+# the 2 in apply(####,3,sd) below is the "margin" param of apply, 1=apply over rows. 2=apply over columns
+SE_ENET = as.vector(as.numeric(round(apply((ENETbootoutput$t),2,sd),6)))
+
+#check out how funky this got...
+names.ENET <- names(coef(ENET.fit, s=bestalphaENET)[,1])
+coef.ENET <- coef(ENET.fit, s=bestalphaENET)[,1]
+
+ENET.coef <- data.frame(SE_ENET)
+ENET.coef$predictors <- names.ENET
+ENET.coef[1,]$predictors <- "Intercept"
+ENET.coef$coef.ENET <- coef.ENET
+rownames(ENET.coef) <- NULL
+ENET.coef.signif <- ENET.coef[which(abs(ENET.coef$coef.ENET) - ENET.coef$SE_ENET > 0),];
+rownames(ENET.coef.signif) <- 1:as.numeric(dim(ENET.coef.signif)[1])
+```
+
+----
+
+##Visualize the random forest model
+
+Using the wonderful randomForestExplainer package found [here](https://cran.rstudio.com/web/packages/randomForestExplainer/vignettes/randomForestExplainer.html). This post has great info on [how to interpret the outputs](https://stats.stackexchange.com/questions/341433/how-to-understand-randomforestexplainer-output-r-package) from this package.
+
+```{r eval=FALSE}
+require(randomForestExplainer)
+min_depth_frame <- min_depth_distribution(rf_cv_caret$finalModel)
+importance_frame <- measure_importance(rf_cv_caret$finalModel)
+```
+
+```{r}
+importance_frame
+min_depth_frame
+```
+
+```{r}
+summary(min_depth_frame)
+```
+
+
+```{r}
+#(vars <- important_variables(importance_frame, k = 100, measures = c("mean_min_depth", "no_of_trees")))
+(vars <- important_variables(importance_frame, k = 100, measures = c( "accuracy_decrease","mean_min_depth","times_a_root", "no_of_nodes")))
+```
+
+```{r}
+#forest <- rf_cv_caret$finalModel
+#interactions_frame <- min_depth_interactions(rf_cv_caret$finalModel, vars, mean_sample = "relevant_trees", uncond_mean_sample = "mean_sample")
+interactions_frame <- min_depth_interactions(forest, vars)
+```
+
+```{r}
+# interactions_frame <- min_depth_interactions(forest, vars)
+save(interactions_frame, file = "day_ordinal.post_amlos.interactions_frame.rda")
+#load("day_ordinal.post_amlos.interactions_frame.rda")
+head(interactions_frame[order(interactions_frame$occurrences, decreasing = TRUE),],50)
+```
+```{r viz_interactions_rf, fig.asp=.4, fig.width=15, warning=FALSE,message=FALSE,error=FALSE }
+plot_min_depth_interactions(interactions_frame)
+```
+```{r}
+#temp.forest <- forest
+#temp.forest$call$formula <- rf_cv_caret$call$form
+formula.rf <- lm(y.disch~.,data=stayday.mini)
+formula.rf.df <- as.data.frame(model.matrix(formula.rf))
+
+plot_predict_interaction(forest, formula.rf.df[,-1], "day_ordinal", "isolationX1")
+
+```
+
+```{r}
+# plot_multi_way_importance(forest, size_measure = "no_of_nodes") # gives the same result as below but takes longer
+plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes", no_of_labels = 20)
+```
+
+```{r}
+plot_multi_way_importance(importance_frame, x_measure = "accuracy_decrease", y_measure = "gini_decrease", size_measure = "p_value", no_of_labels = 10)
+```
+
+```{r fig.asp=1, results='hide', echo=FALSE, warning=FALSE,message=FALSE,error=FALSE}
+plot_importance_ggpairs(importance_frame)
+```
+
+```{r fig.asp=1, results='hide', echo=FALSE, warning=FALSE,message=FALSE,error=FALSE}
+# plot_importance_rankings(forest) # gives the same result as below but takes longer
+plot_importance_rankings(importance_frame)
+```
+
+```{r eval=FALSE}
+require(data.table)
+min_depth_frame.table <- data.table(min_depth_frame)
+#.(.N) is the number of rows in the set
+min_depth_frame.means <- min_depth_frame.table[,.(mean_min_depth=mean(minimal_depth)), by=.(variable)]
+min_depth_frame.means <- min_depth_frame.means[order(min_depth_frame.means$mean_min_depth),]
+head(min_depth_frame.means, 50)
+```
+
+```{r fig.asp=1.5}
+# plot_min_depth_distribution(forest) # gives the same result as below but takes longer
+plot_min_depth_distribution(min_depth_frame, k = 30, mean_sample = "relevant_trees", main = paste0("Depth: Mean + Dist.")) + labs(caption="Figure 20")
+```
+
+```{r}
+# plot_multi_way_importance(forest, size_measure = "no_of_nodes") # gives the same result as below but takes longer
+plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes", no_of_labels = 10)
+```
+
+```{r}
+plot_multi_way_importance(importance_frame, x_measure = "gini_decrease", y_measure = "no_of_nodes", size_measure = "p_value", no_of_labels = 15)
+```
+
+```{r}
+plot_multi_way_importance(importance_frame, x_measure = "no_of_trees", y_measure = "accuracy_decrease", size_measure = "no_of_nodes", no_of_labels = 10) + labs(caption="Figure 9")
+```
+
+```{r fig.asp=1, results='hide', echo=FALSE, warning=FALSE,message=FALSE,error=FALSE}
+# plot_importance_rankings(forest) # gives the same result as below but takes longer
+plot_importance_rankings(importance_frame)
+```
+
+```{r viz_interactions_rf, fig.asp=.4, fig.width=15, warning=FALSE,message=FALSE,error=FALSE }
+plot_min_depth_interactions(interactions_frame)
+```
+
+save data checkpoint...
+
+
+```{r eval=FALSE}
+#forest <- rf_cv_caret$finalModel
+save(rf_cv_caret, file = "PHI_data/rf_cv_caret.rda")
+#save(interactions_frame, file = "PHI_data/mini.interactions_frame.rda")
+#save(stayday.limited, file = "PHI_data/stayday.limited.rda")
+#load("PHI_data/stayday.limited.rda")
+#ny.kaggle <- ny.kaggle.clean
+#ny.kaggle.clean <- NULL
+```
+
+###Appendix
+
+```{r}
+#library(randomForest)
+#stayday.imputed <- rfImpute(y.disch~.-y.days_until_disch,data=stayday.train)
+```
+
+```{r}
+starttime=proc.time()
+set.seed(825)
+
+fit_rf<-randomForest(y.disch~.-y.days_until_disch,
+        data=stayday.train,
+        importance=TRUE,
+        proximity=TRUE,
+        na.action=na.roughfix)
+
+endtime=proc.time()
+endtime[3]-starttime[3]
+```
+
+```{r}
+#https://stackoverflow.com/questions/14106010/parallel-execution-of-random-forest-in-r
+rf <- foreach(ntree=rep(25000, 6), .combine=randomForest::combine,
+              .multicombine=TRUE, .packages='randomForest') %dopar% {
+    randomForest(y.disch~.-y.days_until_disch,data=stayday.train,
+                 ntree=ntree,
+                 importance=TRUE,proximity=TRUE,na.action=na.roughfix)
+                
+                
+                
+rf <- foreach(ntree=rep(25000, 6), .combine=randomForest::combine,
+              .multicombine=TRUE, .packages='randomForest') %dopar% {
+    randomForest(x, y, ntree=ntree)
+              }
+
+
+}
+```
